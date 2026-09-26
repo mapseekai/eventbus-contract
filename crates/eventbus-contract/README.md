@@ -18,7 +18,7 @@ For Go Watermill Redis Stream compatibility, enable the facade feature:
 
 ```toml
 [dependencies]
-eventbus-contract = { version = "0.2.2", features = ["redis-watermill"] }
+eventbus-contract = { version = "0.2.3", features = ["redis-watermill"] }
 ```
 
 ```rust

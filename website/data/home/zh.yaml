@@ -9,7 +9,7 @@ hero:
   lead: eventbus-contract 为发布、订阅、投递确认、重试和死信定义对象安全的 Rust API。
   actions:
     - { label: 阅读文档, url: docs/start/quickstart/, icon: fa-solid fa-book, style: primary }
-    - { label: 查看 API 文档, url: https://docs.rs/eventbus-contract/0.2.2/eventbus_contract/, icon: fa-solid fa-code, style: ghost }
+    - { label: 查看 API 文档, url: https://docs.rs/eventbus-contract/0.2.3/eventbus_contract/, icon: fa-solid fa-code, style: ghost }
     - { label: 查看源码, url: https://github.com/mapseekai/eventbus-contract, icon: fa-brands fa-github, style: ghost }
 
 cards:

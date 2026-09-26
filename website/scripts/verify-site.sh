@@ -111,7 +111,7 @@ require_text "${public_dir}/index.html" "<link rel=canonical href=https://mapsee
 require_regex "${public_dir}/index.html" '<link[^>]+href=/eventbus-contract/scss/[^ >]+\.css[^>]+rel=stylesheet'
 require_regex "${public_dir}/index.html" '<script[^>]+src=/eventbus-contract/js/[^ >]+\.js'
 require_regex "${public_dir}/index.html" 'data-td-index-src=/eventbus-contract/offline-search-index\.[^ >]+\.json'
-require_text "${public_dir}/index.html" "href=https://docs.rs/eventbus-contract/0.2.2/eventbus_contract/"
+require_text "${public_dir}/index.html" "href=https://docs.rs/eventbus-contract/0.2.3/eventbus_contract/"
 require_text "${public_dir}/llms.txt" "文档"
 require_text "${public_dir}/robots.txt" "Allow: /"
 require_text "${public_dir}/robots.txt" "Sitemap:"

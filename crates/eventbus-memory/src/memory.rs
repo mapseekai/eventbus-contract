@@ -122,16 +122,24 @@ impl StreamBackend for MemoryStreamBackend {
         for id in ids {
             if let Some(pending) = group_state.pending.get_mut(&id) {
                 pending.owner = consumer.to_string();
-                pending.delivery_count += 1;
+                let attempt = pending.delivery_count.checked_add(1);
+                pending.delivery_count = attempt.unwrap_or(u32::MAX);
                 pending.last_received = now;
                 pending.last_delivered_at = instant;
                 pending.redelivered = true;
 
+                let Some(attempt) = attempt else {
+                    claimed.push(FetchedEntry::Malformed {
+                        id,
+                        error: EventBusError::Serialization("delivery attempt overflow".into()),
+                    });
+                    continue;
+                };
                 claimed.push(FetchedEntry::Decoded(ClaimedMessage {
                     id,
                     message: Arc::clone(&pending.message),
                     state: PartialDeliveryState {
-                        attempt: pending.delivery_count,
+                        attempt,
                         first_received: pending.first_received,
                         last_received: pending.last_received,
                         redelivered: pending.redelivered,
@@ -233,14 +241,14 @@ impl MemoryStreamBackend {
         for mut entry in entries {
             // Match the wire-boundary normalization that real backends do.
             entry.message.normalize();
-            let attempt = retry_attempt(&entry.message) + 1;
+            let attempt = retry_attempt(&entry.message).checked_add(1);
             let message = Arc::new(entry.message);
             group_state.pending.insert(
                 entry.id.clone(),
                 PendingEntry {
                     message: Arc::clone(&message),
                     owner: consumer.to_string(),
-                    delivery_count: attempt,
+                    delivery_count: attempt.unwrap_or(u32::MAX),
                     first_received: now,
                     last_received: now,
                     last_delivered_at: instant,
@@ -248,6 +256,13 @@ impl MemoryStreamBackend {
                 },
             );
 
+            let Some(attempt) = attempt else {
+                claimed.push(FetchedEntry::Malformed {
+                    id: entry.id,
+                    error: EventBusError::Serialization("delivery attempt overflow".into()),
+                });
+                continue;
+            };
             claimed.push(FetchedEntry::Decoded(ClaimedMessage {
                 id: entry.id,
                 message,

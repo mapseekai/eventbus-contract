@@ -1,10 +1,10 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
-use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, watch, Mutex};
+use tokio::task::{AbortHandle, JoinHandle};
 
 use super::backend::StreamBackend;
 use super::observer::{ErrorObserver, ErrorScope};
@@ -64,6 +64,7 @@ impl<B: StreamBackend> Drop for ConsumerCleanup<B> {
 struct SubscriptionTask {
     handle: JoinHandle<Result<(), EventBusError>>,
     cleaned: oneshot::Receiver<()>,
+    result: Option<Result<(), EventBusError>>,
 }
 
 #[must_use = "subscription is idle until bound; call `.close().await` for graceful shutdown"]
@@ -72,6 +73,7 @@ pub struct StreamSubscription {
     closed: AtomicBool,
     close_tx: watch::Sender<bool>,
     task: Mutex<Option<SubscriptionTask>>,
+    abort_handle: AbortHandle,
     observer: Option<Arc<dyn ErrorObserver>>,
 }
 
@@ -83,6 +85,7 @@ impl StreamSubscription {
         cleaned: oneshot::Receiver<()>,
         observer: Option<Arc<dyn ErrorObserver>>,
     ) -> Self {
+        let abort_handle = task.abort_handle();
         Self {
             name,
             closed: AtomicBool::new(false),
@@ -90,7 +93,9 @@ impl StreamSubscription {
             task: Mutex::new(Some(SubscriptionTask {
                 handle: task,
                 cleaned,
+                result: None,
             })),
+            abort_handle,
             observer,
         }
     }
@@ -99,60 +104,54 @@ impl StreamSubscription {
         &self.name
     }
 
-    /// Returns `true` until [`StreamSubscription::close`] has been invoked
-    /// (or the subscription was dropped). Useful for control planes that
-    /// need to skip already-shutdown subscriptions without racing on close.
+    /// Whether the background consumer task is still running, including
+    /// graceful drain after a close request.
     pub fn is_running(&self) -> bool {
-        !self.closed.load(Ordering::Acquire)
+        !self.abort_handle.is_finished()
     }
 
-    fn begin_shutdown(&self) -> Result<Option<SubscriptionTask>, EventBusError> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(None);
+    fn begin_shutdown(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self.close_tx.send(true);
         }
-
-        let _ = self.close_tx.send(true);
-        let mut guard = self
-            .task
-            .lock()
-            .map_err(|_| EventBusError::Internal("subscription task mutex poisoned".into()))?;
-        Ok(guard.take())
     }
 
+    /// Request graceful shutdown and wait for delivery tasks and cleanup.
+    /// Cancelling this future leaves the task available to a later close/abort.
     pub async fn close(&self) -> Result<(), EventBusError> {
-        let Some(task) = self.begin_shutdown()? else {
-            return Ok(());
-        };
-
-        let result = task
-            .handle
-            .await
-            .map_err(|err| EventBusError::source("subscription task failed", err))
-            .and_then(|result| result);
-        let cleanup = task
-            .cleaned
-            .await
-            .map_err(|_| EventBusError::Internal("consumer cleanup did not complete".into()));
-        result.and(cleanup)
+        self.begin_shutdown();
+        self.wait_for_shutdown().await
     }
 
     /// Abort the background task without waiting for graceful drain. Returns
     /// `Ok(())` if the abort was acknowledged or the task was already done;
     /// surfaces the task's last error if it had one.
     pub async fn abort(&self) -> Result<(), EventBusError> {
-        let Some(task) = self.begin_shutdown()? else {
+        self.begin_shutdown();
+        // Interrupt before taking the join lock: another caller may be
+        // waiting there for a handler that never completes.
+        self.abort_handle.abort();
+        self.wait_for_shutdown().await
+    }
+
+    async fn wait_for_shutdown(&self) -> Result<(), EventBusError> {
+        // Serialize joins, but keep ownership here when a waiter is cancelled.
+        let mut guard = self.task.lock().await;
+        let Some(task) = guard.as_mut() else {
             return Ok(());
         };
-        task.handle.abort();
-        let result = match task.handle.await {
-            Ok(r) => r,
-            Err(err) if err.is_cancelled() => Ok(()),
-            Err(err) => Err(EventBusError::source("subscription task aborted", err)),
-        };
-        let cleanup = task
-            .cleaned
+        if task.result.is_none() {
+            task.result = Some(match (&mut task.handle).await {
+                Ok(result) => result,
+                Err(err) if err.is_cancelled() => Ok(()),
+                Err(err) => Err(EventBusError::source("subscription task failed", err)),
+            });
+        }
+        let cleanup = (&mut task.cleaned)
             .await
             .map_err(|_| EventBusError::Internal("consumer cleanup did not complete".into()));
+        let result = task.result.take().expect("joined subscription task");
+        *guard = None;
         result.and(cleanup)
     }
 }
@@ -197,8 +196,31 @@ impl Drop for StreamSubscription {
                 )),
             );
         }
-        if let Ok(mut guard) = self.task.lock() {
-            let _ = guard.take();
-        }
+        self.task.get_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn close_cancelled_during_cleanup_does_not_repoll_the_join_handle() {
+        let (close_tx, _close_rx) = watch::channel(false);
+        let (cleaned_tx, cleaned) = oneshot::channel();
+        let sub = StreamSubscription::new(
+            "cleanup".into(),
+            close_tx,
+            tokio::spawn(async { Ok(()) }),
+            cleaned,
+            None,
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), sub.close())
+            .await
+            .is_err());
+        cleaned_tx.send(()).unwrap();
+        sub.close().await.unwrap();
+        sub.abort().await.unwrap();
     }
 }

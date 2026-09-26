@@ -89,21 +89,6 @@ pub(super) fn spawn<B: StreamBackend>(
             )
             .await;
         }
-
-        // Final drain after all senders dropped.
-        while let Ok(req) = rx.try_recv() {
-            buf.push(req);
-        }
-        if !buf.is_empty() {
-            flush_batch(
-                &backend,
-                &stream,
-                &group,
-                &mut buf,
-                error_observer.as_deref(),
-            )
-            .await;
-        }
     });
 
     (tx, handle)

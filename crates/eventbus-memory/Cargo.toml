@@ -12,7 +12,7 @@ default = ["test-utils"]
 test-utils = []
 
 [dependencies]
-eventbus-core = { path = "../eventbus-core", version = "0.2.2" }
+eventbus-core = { path = "../eventbus-core", version = "0.2.3" }
 chrono.workspace = true
 tokio.workspace = true
 

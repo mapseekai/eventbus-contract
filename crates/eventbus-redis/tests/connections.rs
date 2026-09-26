@@ -54,6 +54,220 @@ fn message(stream: &str) -> Message {
     }
 }
 
+fn decoded(entry: FetchedEntry) -> eventbus_core::stream::ClaimedMessage {
+    match entry {
+        FetchedEntry::Decoded(message) => message,
+        FetchedEntry::Malformed { error, .. } => panic!("unexpected malformed entry: {error}"),
+    }
+}
+
+fn metadata_key(stream: &str, group: &str) -> String {
+    format!(
+        "eventbus:received:{}:{stream}:{}:{group}",
+        stream.len(),
+        group.len()
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires EVENTBUS_REDIS_URL"]
+async fn large_ack_batch_clears_pending_entries_and_receipt_metadata() {
+    let stream = stream();
+    let backend = RedisBackend::from_client(client()).await.unwrap();
+    backend.create_group(&stream, "group", "0").await.unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..2501 {
+        ids.push(backend.publish(&stream, message(&stream)).await.unwrap());
+    }
+    let entries = backend
+        .read_new(&stream, "group", "worker", ids.len(), Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), ids.len());
+    assert!(entries
+        .into_iter()
+        .all(|entry| decoded(entry).state.attempt == 1));
+
+    backend.ack_many(&stream, "group", &ids).await.unwrap();
+    let mut conn = client().get_multiplexed_async_connection().await.unwrap();
+    let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
+        .arg(&stream)
+        .arg("group")
+        .arg("-")
+        .arg("+")
+        .arg(ids.len())
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(pending.is_empty());
+    let exists: usize = redis::cmd("EXISTS")
+        .arg(metadata_key(&stream, "group"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0);
+    redis::cmd("DEL")
+        .arg(&stream)
+        .query_async::<usize>(&mut conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires EVENTBUS_REDIS_URL"]
+async fn reclaim_state_survives_backend_recreation_and_ack_cleans_metadata() {
+    let stream = stream();
+    let backend = RedisBackend::from_client(client()).await.unwrap();
+    backend.create_group(&stream, "group", "0").await.unwrap();
+    let mut msg = message(&stream);
+    msg.headers
+        .insert(eventbus_core::HEADER_RETRY_ATTEMPT.into(), "3".into());
+    let id = backend.publish(&stream, msg).await.unwrap();
+    let first = decoded(
+        backend
+            .read_new(&stream, "group", "first", 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0),
+    );
+    assert_eq!(first.state.attempt, 4);
+    backend.forget_consumer(&stream, "group", "first").await;
+    drop(backend);
+
+    let backend = RedisBackend::from_client(client()).await.unwrap();
+    for attempt in [5, 6] {
+        let reclaimed = decoded(
+            backend
+                .reclaim_idle(&stream, "group", "second", Duration::ZERO, 1)
+                .await
+                .unwrap()
+                .remove(0),
+        );
+        assert_eq!(reclaimed.id, id);
+        assert_eq!(reclaimed.state.attempt, attempt);
+        assert_eq!(reclaimed.state.first_received, first.state.first_received);
+        assert!(reclaimed.state.last_received >= first.state.last_received);
+        assert!(reclaimed.state.redelivered);
+    }
+    backend
+        .create_group(&stream, "independent", "0")
+        .await
+        .unwrap();
+    let other = decoded(
+        backend
+            .read_new(&stream, "independent", "third", 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .remove(0),
+    );
+    assert_eq!(
+        other.state.attempt, 4,
+        "PEL delivery counts belong to each group"
+    );
+
+    backend
+        .ack_many(&stream, "group", &[id.clone(), id.clone()])
+        .await
+        .unwrap();
+    let mut conn = client().get_multiplexed_async_connection().await.unwrap();
+    let count: usize = redis::cmd("EXISTS")
+        .arg(metadata_key(&stream, "group"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "ACK must remove the last metadata field and its hash"
+    );
+    let count: usize = redis::cmd("EXISTS")
+        .arg(metadata_key(&stream, "independent"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "ACK must not erase another group's first receipt");
+    backend.ack(&stream, "independent", &id).await.unwrap();
+    redis::cmd("DEL")
+        .arg(&stream)
+        .query_async::<usize>(&mut conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires EVENTBUS_REDIS_URL"]
+async fn overflowing_retry_entry_is_isolated_and_reclaim_checks_combined_attempts() {
+    let stream = stream();
+    let backend = RedisBackend::from_client(client()).await.unwrap();
+    backend.create_group(&stream, "group", "0").await.unwrap();
+    let mut bad = message(&stream);
+    bad.headers.insert(
+        eventbus_core::HEADER_RETRY_ATTEMPT.into(),
+        u32::MAX.to_string(),
+    );
+    let bad_id = backend.publish(&stream, bad).await.unwrap();
+    let mut last_attempt = message(&stream);
+    last_attempt.headers.insert(
+        eventbus_core::HEADER_RETRY_ATTEMPT.into(),
+        (u32::MAX - 1).to_string(),
+    );
+    let last_id = backend.publish(&stream, last_attempt).await.unwrap();
+    let mut entries = backend
+        .read_new(&stream, "group", "first", 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(matches!(&entries[0], FetchedEntry::Malformed { id, .. } if id == &bad_id));
+    assert_eq!(decoded(entries.remove(1)).state.attempt, u32::MAX);
+    backend.ack(&stream, "group", &bad_id).await.unwrap();
+    let entries = backend
+        .reclaim_idle(&stream, "group", "second", Duration::ZERO, 1)
+        .await
+        .unwrap();
+    assert!(matches!(&entries[0], FetchedEntry::Malformed { id, .. } if id == &last_id));
+    backend.ack(&stream, "group", &last_id).await.unwrap();
+    let mut conn = client().get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("DEL")
+        .arg(&stream)
+        .query_async::<usize>(&mut conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires EVENTBUS_REDIS_URL"]
+async fn reclaim_cleans_metadata_for_entries_deleted_while_pending() {
+    let stream = stream();
+    let backend = RedisBackend::from_client(client()).await.unwrap();
+    backend.create_group(&stream, "group", "0").await.unwrap();
+    let id = backend.publish(&stream, message(&stream)).await.unwrap();
+    backend
+        .read_new(&stream, "group", "first", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    let mut conn = client().get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("XDEL")
+        .arg(&stream)
+        .arg(id)
+        .query_async::<usize>(&mut conn)
+        .await
+        .unwrap();
+    assert!(backend
+        .reclaim_idle(&stream, "group", "second", Duration::ZERO, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    let exists: usize = redis::cmd("EXISTS")
+        .arg(metadata_key(&stream, "group"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0);
+    redis::cmd("DEL")
+        .arg(&stream)
+        .query_async::<usize>(&mut conn)
+        .await
+        .unwrap();
+}
+
 struct Ack;
 
 impl Handler for Ack {

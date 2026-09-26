@@ -10,6 +10,9 @@ weight: 50
 `OrderingMode::Key` 表示按消息 key 维持顺序的意图；当订阅语义要求 ordered key 时，配置只能搭配
 `OrderingMode::Key`。它不意味着跨 key 的全局顺序，也不能免除重试和多消费者带来的设计考量。
 
+当前 `StreamBus` 尚未实现按 key 的串行调度，会在订阅时明确拒绝 `OrderingMode::Key`，即使
+`max_in_flight = 1` 也一样；单个订阅的串行处理不能保证同组多个消费者之间的顺序。
+
 `ConsumerBalanceMode` 描述同一组消费者如何获得消息：
 
 | Mode | 含义 |

@@ -21,9 +21,9 @@ tracing = ["eventbus-core/tracing"]
 # (e.g. `eventbus-postgres-outbox`).
 
 [dependencies]
-eventbus-core = { path = "../eventbus-core", version = "0.2.2" }
-eventbus-memory = { path = "../eventbus-memory", version = "0.2.2", optional = true }
-eventbus-redis = { path = "../eventbus-redis", version = "0.2.2", optional = true }
+eventbus-core = { path = "../eventbus-core", version = "0.2.3" }
+eventbus-memory = { path = "../eventbus-memory", version = "0.2.3", optional = true }
+eventbus-redis = { path = "../eventbus-redis", version = "0.2.3", optional = true }
 
 [dev-dependencies]
 bytes.workspace = true

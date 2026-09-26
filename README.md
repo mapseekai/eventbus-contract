@@ -3,13 +3,15 @@
 Object-safe event-bus contract for Rust, with a Redis Streams backend and an
 in-process backend for tests.
 
+Minimum supported Rust version: **1.86** (checked in CI with all features and targets).
+
 ## Documentation
 
 The project guide is published at
 [mapseekai.github.io/eventbus-contract](https://mapseekai.github.io/eventbus-contract/).
 Use it for installation, backend guides, delivery semantics, configuration
 constraints, and contributor documentation. Exact API signatures remain on
-[docs.rs](https://docs.rs/eventbus-contract/0.2.2/eventbus_contract/).
+[docs.rs](https://docs.rs/eventbus-contract/0.2.3/eventbus_contract/).
 
 ```toml
 [dependencies]
@@ -21,7 +23,7 @@ Go Watermill streams:
 
 ```toml
 [dependencies]
-eventbus-contract = { version = "0.2.2", features = ["redis-watermill"] }
+eventbus-contract = { version = "0.2.3", features = ["redis-watermill"] }
 ```
 
 ```rust

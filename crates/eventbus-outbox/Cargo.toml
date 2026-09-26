@@ -9,7 +9,7 @@ description = "Outbox + Dispatcher + DeadLetterStore traits"
 publish = false
 
 [dependencies]
-eventbus-core = { path = "../eventbus-core", version = "0.2.2" }
+eventbus-core = { path = "../eventbus-core", version = "0.2.3" }
 bytes.workspace = true
 chrono.workspace = true
 serde.workspace = true

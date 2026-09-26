@@ -24,7 +24,7 @@ pub type Headers = HashMap<String, String>;
 /// Stream / queue identifier. Validated via [`Topic::new`] at construction:
 /// non-empty, ≤ [`Topic::MAX_LEN`] bytes, no ASCII control characters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 #[repr(transparent)]
 pub struct Topic(String);
 
@@ -99,7 +99,7 @@ impl TryFrom<String> for Topic {
 
 /// Consumer group name. Validated: non-empty, ≤ [`ConsumerGroup::MAX_LEN`] bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 #[repr(transparent)]
 pub struct ConsumerGroup(String);
 
@@ -170,7 +170,7 @@ impl TryFrom<String> for ConsumerGroup {
 /// Per-process consumer name. Validated: non-empty, ≤ [`ConsumerName::MAX_LEN`].
 /// Use [`ConsumerName::auto`] to obtain a unique auto-generated name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String")]
 #[repr(transparent)]
 pub struct ConsumerName(String);
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3 - 2026-09-26
+
+- Reconnect Redis command connections created with `from_client` after connection loss.
+- Make subscription close cancellation-safe and allow abort during graceful shutdown.
+- Reject unsupported `OrderingMode::Key` at subscription time.
+- Validate topic, group, and consumer names during deserialization; preserve their string wire format.
+- Isolate overflowing delivery counters as malformed entries instead of panicking.
+- Preserve Redis delivery counts and first-receipt metadata across backend restarts; atomically
+  remove receipt metadata on ACK. Redis deployments now need the scripting/hash ACLs described
+  in the Redis crate README.
+- Raise the minimum supported Rust version to 1.86 and check it in CI.
+- Simplify batch scheduling, ACK draining, and redundant runtime/error wrappers.
+
 ## 0.2.2 - 2026-09-08
 
 Patch release focused on subscription lifecycle correctness and Redis

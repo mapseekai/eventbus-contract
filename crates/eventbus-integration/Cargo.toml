@@ -9,4 +9,4 @@ description = "DDD integration-event helpers atop eventbus-core"
 publish = false
 
 [dependencies]
-eventbus-core = { path = "../eventbus-core", version = "0.2.2" }
+eventbus-core = { path = "../eventbus-core", version = "0.2.3" }

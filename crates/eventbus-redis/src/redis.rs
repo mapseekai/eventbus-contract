@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use dashmap::DashMap;
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection};
 use redis::streams::{StreamId, StreamRangeReply, StreamReadReply};
 use redis::{FromRedisValue, Value};
 use tokio::sync::OnceCell;
@@ -54,6 +54,42 @@ use eventbus_core::stream::{
 };
 use eventbus_core::{Codec, EventBusError, Message, PartialDeliveryState, HEADER_RETRY_ATTEMPT};
 
+// Keep the existing connection-taking constructors while allowing the client
+// constructor to use redis-rs's reconnecting transport.
+#[derive(Clone)]
+enum CommandConnection {
+    Direct(MultiplexedConnection),
+    Managed(ConnectionManager),
+}
+
+impl ConnectionLike for CommandConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> redis::RedisFuture<'a, Value> {
+        match self {
+            Self::Direct(conn) => conn.req_packed_command(cmd),
+            Self::Managed(conn) => conn.req_packed_command(cmd),
+        }
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a redis::Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> redis::RedisFuture<'a, Vec<Value>> {
+        match self {
+            Self::Direct(conn) => conn.req_packed_commands(pipeline, offset, count),
+            Self::Managed(conn) => conn.req_packed_commands(pipeline, offset, count),
+        }
+    }
+
+    fn get_db(&self) -> i64 {
+        match self {
+            Self::Direct(conn) => conn.get_db(),
+            Self::Managed(conn) => conn.get_db(),
+        }
+    }
+}
+
 /// Pre-decode upper bound on the raw envelope size (8 MiB).
 ///
 /// Stops adversarial / runaway producers from forcing the codec to allocate
@@ -62,6 +98,50 @@ use eventbus_core::{Codec, EventBusError, Message, PartialDeliveryState, HEADER_
 /// default JSON codec).
 const MAX_RAW_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const SHARED_READ_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+// Redis records delivery counts and last-delivery time in the PEL, but not the
+// first receipt. Store just that missing fact per group/entry. Reading PEL and
+// updating the hash in one script avoids recreating metadata after an ACK.
+const DELIVERY_STATE_SCRIPT: &str = r#"
+local time = redis.call('TIME')
+local now = time[1] * 1000 + math.floor(time[2] / 1000)
+local states = {}
+for i = 3, #ARGV do
+    local id = ARGV[i]
+    local pending = redis.call('XPENDING', KEYS[1], ARGV[1], id, id, 1)[1]
+    if pending then
+        local received = string.format('%.0f', now - pending[3])
+        if ARGV[2] == 'new' and pending[4] == 1 then
+            redis.call('HSET', KEYS[2], id, received)
+        else
+            redis.call('HSETNX', KEYS[2], id, received)
+        end
+        states[#states + 1] = {pending[4], redis.call('HGET', KEYS[2], id), received}
+    else
+        redis.call('HDEL', KEYS[2], id)
+        states[#states + 1] = {0, 0, 0}
+    end
+end
+return states
+"#;
+
+const ACK_SCRIPT: &str = r#"
+local count = 0
+for first = 2, #ARGV, 1000 do
+    local last = math.min(first + 999, #ARGV)
+    count = count + redis.call('XACK', KEYS[1], ARGV[1], unpack(ARGV, first, last))
+    redis.call('HDEL', KEYS[2], unpack(ARGV, first, last))
+end
+return count
+"#;
+
+fn delivery_metadata_key(stream: &str, group: &str) -> String {
+    format!(
+        "eventbus:received:{}:{stream}:{}:{group}",
+        stream.len(),
+        group.len()
+    )
+}
 
 /// A [`StreamBackend`] backed by a real Redis connection.
 ///
@@ -179,7 +259,7 @@ impl CodecRegistry {
 }
 
 pub struct RedisBackend {
-    conn: MultiplexedConnection,
+    conn: CommandConnection,
     read_client: Option<redis::Client>,
     read_connections: DashMap<StreamGroupConsumerKey, Arc<OnceCell<MultiplexedConnection>>>,
     /// Field-level wire-format registry. Defaults to JSON in a `message` field.
@@ -196,7 +276,9 @@ impl RedisBackend {
     ///
     /// A connection clone shares its socket, so this constructor uses
     /// nonblocking read polling. Prefer [`Self::from_client`] for dedicated
-    /// blocking-read connections and lower idle polling overhead.
+    /// blocking-read connections, automatic command reconnection, and lower
+    /// idle polling overhead. An externally supplied connection cannot be
+    /// reconnected by this backend without its connection settings.
     pub fn new(conn: MultiplexedConnection) -> Self {
         Self::with_codec(conn, Arc::new(JsonCodec))
     }
@@ -207,7 +289,7 @@ impl RedisBackend {
     /// you want to swap in a binary codec for throughput.
     pub fn with_codec(conn: MultiplexedConnection, codec: Arc<dyn Codec>) -> Self {
         Self {
-            conn,
+            conn: CommandConnection::Direct(conn),
             read_client: None,
             read_connections: DashMap::new(),
             registry: CodecRegistry::new(Arc::new(EnvelopeStreamCodec::from_core_codec(codec))),
@@ -215,14 +297,21 @@ impl RedisBackend {
         }
     }
 
-    /// Connect with a shared command connection and lazily create one dedicated
-    /// blocking-read connection per `(stream, group, consumer)`.
+    /// Connect with an automatically reconnecting command connection and lazily
+    /// create one dedicated blocking reader per `(stream, group, consumer)`.
+    /// A command interrupted by connection loss still returns an error: it is
+    /// not replayed automatically, since an XADD may already have succeeded.
     pub async fn from_client(client: redis::Client) -> Result<Self, EventBusError> {
-        let conn = client
-            .get_multiplexed_async_connection()
+        let conn = ConnectionManager::new(client.clone())
             .await
             .map_err(|err| EventBusError::source("connect Redis backend", err))?;
-        Ok(Self::new(conn).with_read_client(client))
+        Ok(Self {
+            conn: CommandConnection::Managed(conn),
+            read_client: Some(client),
+            read_connections: DashMap::new(),
+            registry: CodecRegistry::new(Arc::new(EnvelopeStreamCodec::default())),
+            reclaim_starts: DashMap::new(),
+        })
     }
 
     /// Enable dedicated readers on a backend built with a custom command
@@ -239,7 +328,7 @@ impl RedisBackend {
         stream: &str,
         group: &str,
         consumer: &str,
-    ) -> Result<MultiplexedConnection, EventBusError> {
+    ) -> Result<CommandConnection, EventBusError> {
         let Some(client) = &self.read_client else {
             return Ok(self.conn.clone());
         };
@@ -260,6 +349,75 @@ impl RedisBackend {
         })
         .await
         .cloned()
+        .map(CommandConnection::Direct)
+    }
+
+    async fn delivery_states(
+        &self,
+        stream: &str,
+        group: &str,
+        entries: Vec<FetchedEntry>,
+        reclaimed: bool,
+    ) -> Result<Vec<FetchedEntry>, EventBusError> {
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FetchedEntry::Decoded(message) => Some(message.id.as_str()),
+                FetchedEntry::Malformed { .. } => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return Ok(entries);
+        }
+        let mut conn = self.conn.clone();
+        let states: Vec<(u64, i64, i64)> = redis::Script::new(DELIVERY_STATE_SCRIPT)
+            .key(stream)
+            .key(delivery_metadata_key(stream, group))
+            .arg(group)
+            .arg(if reclaimed { "reclaimed" } else { "new" })
+            .arg(&ids)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|err| EventBusError::source("read Redis delivery state", err))?;
+        if states.len() != ids.len() {
+            return Err(EventBusError::Serialization(
+                "incomplete Redis delivery state".into(),
+            ));
+        }
+        let mut states = states.into_iter();
+        let mut result = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let FetchedEntry::Decoded(mut claimed) = entry else {
+                result.push(entry);
+                continue;
+            };
+            let (deliveries, first, last) = states.next().expect("validated state count");
+            if deliveries == 0 {
+                // Another consumer acknowledged this entry before we inspected it.
+                continue;
+            }
+            let attempt = u32::try_from(deliveries)
+                .ok()
+                .and_then(|n| retry_attempt(&claimed.message).checked_add(n));
+            let timestamps = chrono::DateTime::from_timestamp_millis(first)
+                .zip(chrono::DateTime::from_timestamp_millis(last));
+            match (attempt, timestamps) {
+                (Some(attempt), Some((first_received, last_received))) => {
+                    claimed.state = PartialDeliveryState {
+                        attempt,
+                        first_received,
+                        last_received,
+                        redelivered: reclaimed || deliveries > 1,
+                    };
+                    result.push(FetchedEntry::Decoded(claimed));
+                }
+                _ => result.push(FetchedEntry::Malformed {
+                    id: claimed.id,
+                    error: EventBusError::Serialization("invalid Redis delivery state".into()),
+                }),
+            }
+        }
+        Ok(result)
     }
 
     /// Register a read codec for every consumer reading from `stream`.
@@ -448,7 +606,25 @@ impl StreamBackend for RedisBackend {
             .map_err(|e| EventBusError::source(format!("xautoclaim on {stream}"), e))?;
 
         let codec = self.registry.read_codec(stream, group, consumer);
+        // Redis 7+ reports entries deleted from the stream while still pending.
+        if let Value::Array(items) = &raw {
+            if let Some(deleted) = items.get(2) {
+                let ids: Vec<String> = FromRedisValue::from_redis_value(deleted.clone())
+                    .map_err(|err| EventBusError::source("decode deleted pending IDs", err))?;
+                if !ids.is_empty() {
+                    redis::cmd("HDEL")
+                        .arg(delivery_metadata_key(stream, group))
+                        .arg(ids)
+                        .query_async::<()>(&mut conn)
+                        .await
+                        .map_err(|err| {
+                            EventBusError::source("clean deleted delivery state", err)
+                        })?;
+                }
+            }
+        }
         let (next_start, claimed) = parse_autoclaim(raw, stream, codec.as_ref())?;
+        let claimed = self.delivery_states(stream, group, claimed, true).await?;
         self.reclaim_starts.insert(cursor_key, next_start);
         Ok(claimed)
     }
@@ -507,7 +683,7 @@ impl StreamBackend for RedisBackend {
                 .map(|entry| decode_entry(stream, entry, false, codec.as_ref()))
                 .collect();
             if !entries.is_empty() || blocking || Instant::now() >= deadline {
-                return Ok(entries);
+                return self.delivery_states(stream, group, entries, false).await;
             }
             tokio::time::sleep(
                 SHARED_READ_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
@@ -517,21 +693,12 @@ impl StreamBackend for RedisBackend {
     }
 
     async fn ack(&self, stream: &str, group: &str, message_id: &str) -> Result<(), EventBusError> {
-        let mut conn = self.conn.clone();
-        let _: i64 = redis::cmd("XACK")
-            .arg(stream)
-            .arg(group)
-            .arg(message_id)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| EventBusError::source(format!("xack {message_id}"), e))?;
-        Ok(())
+        self.ack_many(stream, group, &[message_id.to_owned()]).await
     }
 
-    /// Single-command XACK for N ids — one RTT for the whole batch.
-    ///
-    /// This is the throughput knob that turns ack rate from
-    /// `(1 / RTT)` into `(batch_size / RTT)` — typically 20×+ on LAN Redis.
+    /// Acknowledge a batch and remove receipt metadata atomically in one
+    /// server round-trip. Large batches are chunked inside the script to
+    /// stay within Lua's argument-stack limit.
     async fn ack_many(
         &self,
         stream: &str,
@@ -543,13 +710,12 @@ impl StreamBackend for RedisBackend {
         }
 
         let mut conn = self.conn.clone();
-        let mut cmd = redis::cmd("XACK");
-        cmd.arg(stream).arg(group);
-        for id in message_ids {
-            cmd.arg(id);
-        }
-        let _: i64 = cmd
-            .query_async(&mut conn)
+        let _: i64 = redis::Script::new(ACK_SCRIPT)
+            .key(stream)
+            .key(delivery_metadata_key(stream, group))
+            .arg(group)
+            .arg(message_ids)
+            .invoke_async(&mut conn)
             .await
             .map_err(|e| EventBusError::source(format!("xack batch on {stream}"), e))?;
         Ok(())
@@ -604,7 +770,12 @@ fn decode_entry(
     // `trace_context()` without each call re-reading headers.
     message.normalize();
 
-    let attempt = retry_attempt(&message) + 1;
+    let Some(attempt) = retry_attempt(&message).checked_add(1) else {
+        return FetchedEntry::Malformed {
+            id,
+            error: EventBusError::Serialization("delivery attempt overflow".into()),
+        };
+    };
     let now = Utc::now();
 
     FetchedEntry::Decoded(ClaimedMessage {
@@ -749,6 +920,79 @@ mod tests {
 
     use super::*;
     use crate::codec::{EnvelopeStreamCodec, RedisStreamCodec, REDIS_FIELD_MESSAGE};
+
+    #[tokio::test]
+    #[ignore = "requires EVENTBUS_REDIS_URL"]
+    async fn client_backend_recovers_publish_ack_and_reclaim_after_command_disconnect() {
+        let client = redis::Client::open(std::env::var("EVENTBUS_REDIS_URL").unwrap()).unwrap();
+        let backend = RedisBackend::from_client(client.clone()).await.unwrap();
+        let stream = format!(
+            "eventbus-reconnect-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        backend.create_group(&stream, "group", "0").await.unwrap();
+        let msg = Message {
+            uid: "retry".into(),
+            topic: eventbus_core::Topic::new(&stream).unwrap(),
+            key: String::new(),
+            kind: "test".into(),
+            source: "test".into(),
+            occurred_at: Utc::now(),
+            headers: HashMap::new(),
+            payload: bytes::Bytes::new(),
+            content_type: None,
+            event_version: None,
+            idempotency_key: None,
+            expires_at: None,
+            trace_uid: None,
+            correlation_uid: None,
+        };
+        let original = backend.publish(&stream, msg.clone()).await.unwrap();
+        backend
+            .read_new(&stream, "group", "first", 1, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut conn = backend.conn.clone();
+        let id: i64 = redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let mut admin = client.get_multiplexed_async_connection().await.unwrap();
+        let killed: usize = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(id)
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(killed, 1);
+        let published = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match backend.publish(&stream, msg.clone()).await {
+                    Ok(id) => break id,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("command connection must reconnect");
+        let reclaimed = backend
+            .reclaim_idle(&stream, "group", "second", Duration::ZERO, 1)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reclaimed[0], FetchedEntry::Decoded(entry) if entry.id == original && entry.state.attempt == 2)
+        );
+        backend.ack(&stream, "group", &original).await.unwrap();
+        assert_ne!(published, original);
+        redis::cmd("DEL")
+            .arg(&stream)
+            .query_async::<usize>(&mut admin)
+            .await
+            .unwrap();
+    }
 
     fn assert_stream_backend<T: StreamBackend>() {}
 

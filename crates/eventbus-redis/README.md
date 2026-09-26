@@ -72,15 +72,20 @@ Auto-detect is read-only. It tries matching codecs in order and can continue to 
 ## Connection / TLS / auth
 
 `RedisBackend::from_client(client).await` and `stream_bus_from_client(client, options).await`
-create a command connection and lazily open a dedicated blocking-read connection for each
+create a reconnecting command connection and lazily open a dedicated blocking-read connection for each
 `(stream, group, consumer)`. Idle readers cannot hold up publishing, ACKs, or other consumers.
 The client selects the URL, database, TLS and authentication settings.
+Commands interrupted by a disconnect return an error; subsequent calls use the reconnected
+transport. Failed publishes are not automatically replayed because the server may already
+have appended them. Application retries still require idempotent consumers.
 
 `RedisBackend::new(connection)`, `with_codec(connection, codec)` and
 `stream_bus_from_connection` remain available. Since a cloned `MultiplexedConnection`
 shares its socket, these constructors use nonblocking reads with a 10 ms polling interval.
 For a custom command connection or codec, use `.with_read_client(client)` to enable
 dedicated readers; the client must address the same Redis server and database.
+Externally supplied command connections are not automatically reconnected; use the client
+constructor when the backend should own connection recovery.
 
 Subscription close, abort and task exit release its read connection, reclaim cursor and
 subscription-specific codec registration. Stream/group codec registrations persist.
@@ -92,6 +97,28 @@ consumer name after closing it.
 the Tokio runtime; asynchronous cleanup cannot run after the runtime has stopped.
 
 The crate does not require, default to, or downgrade TLS.
+
+## Delivery state
+
+`attempt` combines the envelope's retry count with the current entry's Redis PEL delivery
+count. Reclaiming an unacknowledged entry therefore consumes another attempt, including
+across consumer/backend restarts. `first_received` is stored in a per-stream/group Redis
+hash; `last_received` comes from the PEL idle time and Redis server clock.
+
+The metadata key is `eventbus:received:<stream-byte-length>:<stream>:<group-byte-length>:<group>`.
+This namespace is reserved for the backend. ACK removes the corresponding metadata in the
+same Lua script; reclaim also removes metadata for pending entries deleted from the stream
+(Redis 7+). If an administrator deletes a whole stream or consumer group externally, they
+must also delete its metadata hash. Do not give the hash a shorter lifetime than pending entries.
+
+Redis does not retain the first-delivery timestamp itself. For legacy pending entries, or a
+crash between delivery and the first metadata write, the first receipt available to this
+backend is used as the initial timestamp; subsequent reclaims preserve it.
+
+In addition to stream commands, Redis ACLs must allow scripting (`EVALSHA`, `SCRIPT LOAD`)
+and the script commands `TIME`, `XPENDING`, `HSET`, `HSETNX`, `HGET`, and `HDEL` on the
+metadata namespace. This backend uses a standalone `redis::Client`; it does not provide
+Redis Cluster routing.
 
 ## Performance checks
 

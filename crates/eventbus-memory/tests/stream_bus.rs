@@ -479,12 +479,13 @@ async fn retry_max_routes_to_dead_letter_stream() {
     .await
     .expect("dead letter written");
 
+    // Publishing to the DLQ precedes the ACK round-trip and handler completion.
+    sub.close().await.expect("close sub");
     // `max_retry: 1` means one *retry* on top of the initial delivery, so the
     // handler runs twice before the message ends up in the DLQ.
     assert_eq!(backend.stream_len("evt.retry.max.dlq").await, 1);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(result.lock().await.len(), 2);
-    sub.close().await.expect("close sub");
     assert_eq!(
         backend.pending_count("evt.retry.max", "cg.retry.max").await,
         0

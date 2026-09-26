@@ -9,8 +9,8 @@ use tokio::{
 };
 
 use crate::{
-    AckMode, BatchOutcome, BoxedError, DeliveryControl, DeliveryHandle, EventBusError, Handler,
-    Message, MessageId, PublishOptions, Publisher, Subscriber, SubscriptionConfig,
+    AckMode, BatchOutcome, DeliveryControl, DeliveryHandle, EventBusError, Handler, Message,
+    MessageId, PublishOptions, Publisher, Subscriber, SubscriptionConfig,
 };
 
 use super::{
@@ -38,22 +38,12 @@ type DeliveryTaskResult = Result<(), EventBusError>;
 /// [`OwnedSemaphorePermit`] from `limiter`, for the full handler + ack
 /// round-trip. The permit drops with the `Delivery`, so every termination
 /// path (success, panic, cancel, orphan) returns the slot automatically.
+#[derive(Clone)]
 struct RuntimeState {
     handler: Arc<dyn Handler>,
     config: Arc<SubscriptionConfig>,
     limiter: Arc<Semaphore>,
     ack_tx: mpsc::Sender<AckRequest>,
-}
-
-impl Clone for RuntimeState {
-    fn clone(&self) -> Self {
-        Self {
-            handler: Arc::clone(&self.handler),
-            config: Arc::clone(&self.config),
-            limiter: Arc::clone(&self.limiter),
-            ack_tx: self.ack_tx.clone(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -328,16 +318,9 @@ impl<B: StreamBackend> StreamBus<B> {
             tokio::time::sleep(delay).await;
         }
 
-        let max_payload_bytes = self.options.max_payload_bytes;
-        let prepared: Vec<(usize, Result<Message, EventBusError>)> = msgs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, m)| (idx, Self::prepare_message(m, &opts, max_payload_bytes)))
-            .collect();
-
-        let total = prepared.len();
+        let total = msgs.len();
         let parallelism = total.clamp(1, self.options.publish_batch_parallelism);
-        let mut iter = prepared.into_iter();
+        let mut iter = msgs.into_iter().enumerate();
         let mut tasks: JoinSet<(usize, Result<MessageId, EventBusError>)> = JoinSet::new();
         let mut results: Vec<Option<Result<MessageId, EventBusError>>> =
             std::iter::repeat_with(|| None).take(total).collect();
@@ -345,8 +328,12 @@ impl<B: StreamBackend> StreamBus<B> {
         // Pre-fill each spawned slot with a placeholder so a task panic
         // (which loses its captured `idx` inside JoinError) still leaves a
         // correctly-attributed error in the right slot.
-        for _ in 0..parallelism {
-            if let Some((idx, prep)) = iter.next() {
+        loop {
+            while tasks.len() < parallelism {
+                let Some((idx, message)) = iter.next() else {
+                    break;
+                };
+                let prep = Self::prepare_message(message, &opts, self.options.max_payload_bytes);
                 results[idx] = Some(Err(EventBusError::Internal(
                     "publish task did not complete".into(),
                 )));
@@ -362,14 +349,12 @@ impl<B: StreamBackend> StreamBus<B> {
                     (idx, r)
                 });
             }
-        }
-
-        while let Some(joined) = tasks.join_next().await {
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
             match joined {
                 Ok((idx, r)) => {
-                    if idx < results.len() {
-                        results[idx] = Some(r);
-                    }
+                    results[idx] = Some(r);
                 }
                 Err(je) => {
                     // The placeholder stays in place at the panicking task's
@@ -379,22 +364,6 @@ impl<B: StreamBackend> StreamBus<B> {
                         obs.on_panic(ErrorScope::HandlerPanic, &je.to_string());
                     }
                 }
-            }
-            if let Some((next_idx, prep)) = iter.next() {
-                results[next_idx] = Some(Err(EventBusError::Internal(
-                    "publish task did not complete".into(),
-                )));
-                let backend = Arc::clone(&self.backend);
-                tasks.spawn(async move {
-                    let r = match prep {
-                        Err(e) => Err(e),
-                        Ok(m) => {
-                            let topic = m.topic.clone();
-                            backend.publish(topic.as_str(), m).await.map(MessageId::new)
-                        }
-                    };
-                    (next_idx, r)
-                });
             }
         }
 
@@ -742,8 +711,7 @@ impl<B: StreamBackend> StreamBus<B> {
                 permit,
             ));
             if config.dead_letter_topic.is_some() {
-                let reason: BoxedError = Box::new(SimpleError(oversize_err.to_string()));
-                return delivery.nack(reason).await;
+                return delivery.nack(Box::new(oversize_err)).await;
             }
             return Err(oversize_err);
         }
@@ -785,11 +753,10 @@ impl<B: StreamBackend> StreamBus<B> {
                 let result = handler.handle(proxy_boxed).await;
                 // If the handler did not finalize via the proxy, do it for them.
                 if let Some(remaining) = tracker.take_remaining() {
-                    match &result {
+                    match result {
                         Ok(()) => remaining.ack().await?,
                         Err(err) => {
-                            let reason: BoxedError = Box::new(SimpleError(err.to_string()));
-                            remaining.retry(reason).await?;
+                            remaining.retry(Box::new(err)).await?;
                         }
                     }
                 }
@@ -798,19 +765,6 @@ impl<B: StreamBackend> StreamBus<B> {
         }
     }
 }
-
-/// Concrete error type used to wrap [`EventBusError`] strings into a
-/// [`BoxedError`] when finalizing a delivery from inside the consume loop.
-#[derive(Debug)]
-struct SimpleError(String);
-
-impl std::fmt::Display for SimpleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for SimpleError {}
 
 impl<B: StreamBackend> Publisher for StreamBus<B> {
     fn publish(
@@ -862,6 +816,12 @@ impl<B: StreamBackend> StreamBus<B> {
         if cfg.balance_mode == Some(crate::ConsumerBalanceMode::FanOut) {
             return Err(EventBusError::Validation(
                 "FanOut balance mode is not yet supported by StreamBus".into(),
+            ));
+        }
+
+        if cfg.ordering_mode == Some(crate::OrderingMode::Key) {
+            return Err(EventBusError::Validation(
+                "Key ordering is not supported by StreamBus".into(),
             ));
         }
 

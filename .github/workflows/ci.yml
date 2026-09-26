@@ -9,6 +9,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+      - name: Check minimum supported Rust version
+        run: cargo check --workspace --all-features --all-targets --locked
+
   test:
     runs-on: ubuntu-latest
     services:
@@ -36,6 +45,6 @@ jobs:
       - name: Redis connection regressions
         env:
           EVENTBUS_REDIS_URL: redis://127.0.0.1:6379/
-        run: cargo test -p eventbus-redis --all-features --test connections -- --ignored
+        run: cargo test -p eventbus-redis --all-features -- --ignored
       - name: Clippy (workspace, all features and targets)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings

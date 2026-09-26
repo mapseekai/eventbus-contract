@@ -13,7 +13,7 @@ tls = ["redis/tls-native-tls", "redis/tokio-native-tls-comp"]
 watermill = ["dep:rmp-serde"]
 
 [dependencies]
-eventbus-core = { path = "../eventbus-core", version = "0.2.2" }
+eventbus-core = { path = "../eventbus-core", version = "0.2.3" }
 bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
