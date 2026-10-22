@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides repository-wide guidance to AI coding agents.
 
 ## Commands
 
@@ -24,7 +24,7 @@ Integration tests in `tests/` use `MemoryStreamBackend` and require no external 
 
 ## Architecture
 
-This is a pure Rust **event bus contract library** (`eventbus-contract`). It defines traits and types for event-driven messaging. The concrete transport is pluggable — only one backend (`RedisStreamBus`) is implemented, with a `MemoryStreamBackend` for testing.
+This is a pure Rust **event bus contract library** (`eventbus-contract`). It defines traits and types for event-driven messaging. The concrete transport is pluggable — only one backend (`StreamBus`) is implemented, with a `MemoryStreamBackend` for testing.
 
 ### Layer 1 — Core traits (`src/eventbus/mod.rs`)
 
@@ -51,14 +51,14 @@ Value objects and policies with validation:
 - `ConsumerBalanceMode`: `Competing | FanOut`
 - `BackpressurePolicy`: `max_in_flight`, `max_pending_acks`, `max_batch_size`, `overflow_strategy`
 
-### Layer 3 — Redis Stream backend (`src/redis_stream/`)
+### Layer 3 — Redis Stream backend (`crates/eventbus-core/src/stream/`)
 
-`RedisStreamBus<B: StreamBackend>` implements `Publisher + Subscriber`. The `StreamBackend` trait decouples the bus logic from the actual stream store:
+`StreamBus<B: StreamBackend>` implements `Publisher + Subscriber`. The `StreamBackend` trait decouples the bus logic from the actual stream store:
 
 - `MemoryStreamBackend` — in-process, used by all integration tests
 - `RedisBackend` — real Redis Streams, compiled only with `--features redis-backend`
 
-`RedisStreamBusOptions` configures blocking poll timeouts, idle-claim timeouts, and consumer group start position.
+`StreamBusOptions` configures blocking poll timeouts, idle-claim timeouts, and consumer group start position.
 
 ### Supporting modules
 
